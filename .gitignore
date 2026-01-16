@@ -1,0 +1,14 @@
+# data & exports
+data/
+exports/
+runs/
+artifacts/
+*.zip
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# misc
+.DS_Store
