@@ -3,5 +3,3 @@ pyyaml
 opencv-python
 numpy
 tqdm
-paddlepaddle-gpu
-paddleocr

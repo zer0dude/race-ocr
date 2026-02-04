@@ -144,6 +144,43 @@ def greedy_match(gt: List[Box], pred: List[Box], iou_thr: float) -> Tuple[List[T
     unmatched_pred = [i for i in range(len(pred)) if i not in used_p]
     return matches, unmatched_gt, unmatched_pred
 
+def job_tag_from_image_path(p: Path) -> str:
+    """
+    Used to prefix output filenames so job-9 and job-10 don't overwrite
+    each other when mined into the same out_dir.
+    """
+    s = str(p)
+    if "/job-9" in s or "job-9" in s:
+        return "job-9"
+    if "/job-10" in s or "job-10" in s:
+        return "job-10"
+    return "job-unk"
+
+
+def bucket_per_class(gt_c: List[Box], pr_c: List[Box], iou_thr: float) -> Tuple[str, int, int, int, float]:
+    """
+    Evaluate one class independently.
+    Returns: (bucket, n_gt, n_pred, n_matches, best_iou)
+
+    Bucket rules:
+      - fn if any unmatched GT boxes exist
+      - else fp if any unmatched predicted boxes exist
+      - else ok
+    """
+    matches, un_gt, un_pr = greedy_match(gt_c, pr_c, iou_thr=iou_thr)
+    best_iou = max((m[2] for m in matches), default=0.0)
+
+    has_fn = len(un_gt) > 0
+    has_fp = len(un_pr) > 0
+
+    if has_fn:
+        bucket = "fn"
+    elif has_fp:
+        bucket = "fp"
+    else:
+        bucket = "ok"
+
+    return bucket, len(gt_c), len(pr_c), len(matches), best_iou
 
 def main():
     ap = argparse.ArgumentParser()
@@ -151,10 +188,27 @@ def main():
     ap.add_argument("--gt_dir", required=True, help="Directory with GT overlay images (from render_gt.py)")
     ap.add_argument("--pred_dirs", nargs="+", required=True, help="Prediction chunk dirs (part_00 part_01 ...)")
     ap.add_argument("--out_dir", required=True, help="Output directory for buckets + report")
+
+    # Matching
     ap.add_argument("--iou_match", type=float, default=0.30, help="IoU threshold to consider a detection matched (recall proxy)")
-    ap.add_argument("--iou_loc", type=float, default=0.50, help="IoU threshold for 'good localization' (below => loc error)")
     ap.add_argument("--pred_has_conf", action="store_true", help="Prediction labels include conf (save_conf)")
+
+    # Class bucketing
+    ap.add_argument(
+        "--class_names",
+        nargs="+",
+        required=True,
+        help="Class names in index order, e.g. race_bibs hedbands bike-labels hand_written",
+    )
+
+    # Output control
     ap.add_argument("--max_per_bucket", type=int, default=0, help="0 = no limit")
+    ap.add_argument(
+        "--job_tag",
+        default=None,
+        help="Optional fixed job tag for output filenames (overrides auto-detect from path), e.g. job-9 or job-10",
+    )
+
     args = ap.parse_args()
 
     val_list = Path(args.val_list)
@@ -175,22 +229,27 @@ def main():
             if img:
                 pred_img_by_stem[stem] = img
 
-    # Prepare buckets
-    buckets = {
-        "fp": 0,
-        "fn": 0,
-        "loc": 0,
-        "ok": 0,
-        "missing_assets": 0,
+    # Prepare buckets and report rows
+    class_names = args.class_names
+    nc = len(class_names)
+
+    # Per-class bucket counts
+    counts: Dict[str, Dict[str, int]] = {
+        cname: {"fn": 0, "fp": 0, "ok": 0, "missing_assets": 0} for cname in class_names
     }
 
     report_rows = []
 
     max_per = args.max_per_bucket if args.max_per_bucket > 0 else None
-    saved_counts = {"fp": 0, "fn": 0, "loc": 0, "ok": 0}
+    saved_counts: Dict[str, Dict[str, int]] = {
+        cname: {"fn": 0, "fp": 0, "ok": 0} for cname in class_names
+    }
 
     for img_path in read_list(val_list):
         stem = img_path.stem
+
+        # Used to prefix output filenames, to avoid overwriting when mining job-9 + job-10
+        tag = args.job_tag or job_tag_from_image_path(img_path)
 
         gt_img = gt_dir / img_path.name
         pred_img = pred_img_by_stem.get(stem)
@@ -200,54 +259,46 @@ def main():
         pred_lbl = pred_lbl_by_stem.get(stem)
 
         if not gt_img.exists() or pred_img is None or pred_lbl is None:
-            buckets["missing_assets"] += 1
+            for cname in class_names:
+                counts[cname]["missing_assets"] += 1
             continue
 
         gt_boxes = parse_yolo_label_file(gt_lbl, has_conf=False)
         pred_boxes = parse_yolo_label_file(pred_lbl, has_conf=args.pred_has_conf)
 
-        matches, un_gt, un_pr = greedy_match(gt_boxes, pred_boxes, iou_thr=args.iou_match)
+        # Per-class bucketing
+        for c in range(nc):
+            cname = class_names[c]
+            gt_c = [b for b in gt_boxes if b.cls == c]
+            pr_c = [b for b in pred_boxes if b.cls == c]
 
-        has_fn = len(un_gt) > 0
-        has_fp = len(un_pr) > 0
+            bucket, n_gt_c, n_pred_c, n_matches_c, best_iou_c = bucket_per_class(
+                gt_c, pr_c, iou_thr=args.iou_match
+            )
 
-        # Localization error: matched but low IoU (below iou_loc)
-        loc_bad = False
-        if matches:
-            best_iou = max(m[2] for m in matches)
-            if best_iou < args.iou_loc:
-                loc_bad = True
-        else:
-            best_iou = 0.0
+            counts[cname][bucket] += 1
 
-        # Decide bucket (priority: fn > fp > loc > ok)
-        if has_fn:
-            bucket = "fn"
-        elif has_fp:
-            bucket = "fp"
-        elif loc_bad:
-            bucket = "loc"
-        else:
-            bucket = "ok"
+            # Save side-by-side image into: out_dir/<class_name>/<bucket>/
+            if max_per is None or saved_counts[cname][bucket] < max_per:
+                out_name = f"{tag}__{img_path.name}"
+                out_path = out_dir / cname / bucket / out_name
+                make_side_by_side(gt_img, pred_img, out_path)
+                saved_counts[cname][bucket] += 1
 
-        buckets[bucket] += 1
+            report_rows.append({
+                "image": str(img_path),
+                "job": tag,
+                "class_id": c,
+                "class_name": cname,
+                "bucket": bucket,
+                "n_gt_c": n_gt_c,
+                "n_pred_c": n_pred_c,
+                "n_matches_c": n_matches_c,
+                "n_fn_c": max(0, n_gt_c - n_matches_c),
+                "n_fp_c": max(0, n_pred_c - n_matches_c),
+                "best_iou_c": best_iou_c,
+            })
 
-        # Save side-by-side image if within limit
-        if max_per is None or saved_counts[bucket] < max_per:
-            out_path = out_dir / bucket / img_path.name
-            make_side_by_side(gt_img, pred_img, out_path)
-            saved_counts[bucket] += 1
-
-        report_rows.append({
-            "image": str(img_path),
-            "bucket": bucket,
-            "n_gt": len(gt_boxes),
-            "n_pred": len(pred_boxes),
-            "n_matches": len(matches),
-            "n_fn": len(un_gt),
-            "n_fp": len(un_pr),
-            "best_iou": best_iou,
-        })
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -262,8 +313,8 @@ def main():
             w.writerow(r)
 
     print("Done.")
-    print("Bucket counts:", buckets)
-    print("Saved side-by-side counts:", saved_counts)
+    for cname in class_names:
+        print(f"{cname}: {counts[cname]} | saved: {saved_counts[cname]}")
     print("Report:", csv_path.resolve())
 
 

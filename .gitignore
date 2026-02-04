@@ -7,6 +7,9 @@ artifacts/
 
 # python
 .venv/
+.venv-*/
+.venv-yolo/
+.venv-paddle/
 __pycache__/
 *.pyc
 
