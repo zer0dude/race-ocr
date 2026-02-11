@@ -1,0 +1,76 @@
+{
+    "input_path": "/data/repos/race-ocr/data/golden/job9_val_50/bib_crops/496060589_1333850945411283_5415054244328932772_n__bib_000__c0.739.jpg",
+    "page_index": null,
+    "model_settings": {
+        "use_doc_preprocessor": false,
+        "use_textline_orientation": false
+    },
+    "dt_polys": [
+        [
+            [
+                5,
+                11
+            ],
+            [
+                42,
+                16
+            ],
+            [
+                40,
+                31
+            ],
+            [
+                2,
+                26
+            ]
+        ]
+    ],
+    "text_det_params": {
+        "limit_side_len": 64,
+        "limit_type": "min",
+        "thresh": 0.3,
+        "max_side_limit": 4000,
+        "box_thresh": 0.6,
+        "unclip_ratio": 1.5
+    },
+    "text_type": "general",
+    "textline_orientation_angles": [
+        -1
+    ],
+    "text_rec_score_thresh": 0.0,
+    "return_word_box": false,
+    "rec_texts": [
+        "69368"
+    ],
+    "rec_scores": [
+        0.992715060710907
+    ],
+    "rec_polys": [
+        [
+            [
+                5,
+                11
+            ],
+            [
+                42,
+                16
+            ],
+            [
+                40,
+                31
+            ],
+            [
+                2,
+                26
+            ]
+        ]
+    ],
+    "rec_boxes": [
+        [
+            2,
+            11,
+            42,
+            31
+        ]
+    ]
+}
