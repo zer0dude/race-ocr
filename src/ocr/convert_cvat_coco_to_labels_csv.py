@@ -20,6 +20,11 @@ Usage:
     --coco_json /path/to/instances_default.json \
     --out_csv /data/repos/race-ocr/data/golden/job9_val_50/labels.csv
 
+python src/ocr/convert_cvat_coco_to_labels_csv.py \
+    --coco_json /data/repos/race-ocr/data/ocr/headbands_100/ocr_labels/instances_default.json \
+    --images_dir /data/repos/race-ocr/data/ocr/headbands_100/bib_crops \
+    --out_csv /data/repos/race-ocr/data/ocr/headbands_100/labels.csv
+
   python scripts/convert_cvat_coco_to_labels_csv.py \
     --coco_json /path/to/instances_default.json \
     --images_dir /data/repos/race-ocr/data/golden/job9_val_50/bib_crops \

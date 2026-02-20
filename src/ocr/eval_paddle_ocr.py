@@ -2,26 +2,50 @@
 """
 Evaluate PaddleOCR (PP-OCRv5 via paddleocr.PaddleOCR) on a crop dataset.
 
-This script is tailored for the "race-ocr" style setup where:
-- labels.csv contains the ground-truth text per crop (one correct solution per crop).
-- meta.csv contains absolute crop paths (and other metadata).
-- OCR may output 0, 1, or many detection boxes per crop.
-- We select the OCR result of the *largest* detected box as the single prediction.
+Key evaluation behavior (tailored for race-ocr):
+- Each crop corresponds to exactly one label string (e.g., bib_id), OR can be "empty".
+- OCR may return 0..N boxes; we select the prediction from the *largest* box.
+- Bounding-box overlap with label boxes is NOT evaluated. Only string match matters.
+- Confidence thresholding is supported:
+    - Only predictions with score >= --conf_thresh are considered "valid predictions".
+    - Below-threshold predictions are treated as "no prediction" for evaluation.
+- Some images may be empty; for those, "no prediction" is considered correct.
 
-Outputs are written under:
-    <repo_root_or_cwd>/runs/ocr/<run_name>/
+Input files:
+- labels.csv must contain at least: file_name, bib_id
+  - If bib_id is empty/NaN/whitespace, it is treated as GT-empty.
+  - labels.csv may optionally contain crop_path.
+- meta.csv is optional; used only to map filename -> crop_path if provided.
+- crops_dir can be used instead of meta.csv: crops_dir / file_name must exist.
+
+Input path resolution (priority order):
+1) If labels.csv provides crop_path and the file exists -> use it.
+2) Else if --crops_dir is given -> use crops_dir / file_name.
+3) Else if --meta_csv is given -> map basename -> crop_path from meta.csv.
+4) Else -> fail with a clear error.
+
+Outputs under:
+    <output_root>/<run_name>/
 
 Artifacts:
 - pred_json/<stem>.json         Full OCR output + chosen box/text (+ GT + errors if any)
 - pred_imgs/<stem>.jpg          Visualization (all boxes + chosen highlighted) (best-effort)
-- predictions.csv               labels.csv extended with predicted values + selected bbox + errors
-- prediction_summary.json       Basic evaluation metrics
+- predictions.csv               labels.csv extended with prediction fields + errors
+- prediction_summary.json       Metrics + config
 
-Dependencies:
-- paddleocr
-- pandas
-- pillow
-- numpy (recommended)
+Metrics:
+- coverage_valid: fraction of samples with a valid prediction (passes confidence threshold)
+- accuracy_allow_empty: fraction of samples correct under:
+    - GT non-empty: valid pred AND pred_norm==gt_norm
+    - GT empty: no valid pred
+- precision_valid: among valid predictions only, fraction with pred_norm==gt_norm
+
+Example:
+python src/ocr/eval_paddle_ocr.py \
+  --labels_csv /data/repos/race-ocr/data/ocr/handwritten_256/labels.csv \
+  --crops_dir /data/repos/race-ocr/data/ocr/handwritten_256/bib_crops \
+  --device gpu \
+  --run_name handwritten_256
 """
 
 from __future__ import annotations
@@ -123,13 +147,12 @@ def json_dump_safe(payload: Dict[str, Any], indent: int = 2) -> str:
     try:
         return json.dumps(to_jsonable(payload), indent=indent)
     except TypeError:
-        # Last resort: stringify unknown objects
         return json.dumps(to_jsonable(payload), indent=indent, default=str)
 
 
 def normalize_text(s: Any) -> str:
     """
-    Normalize OCR text for robust exact-match checks.
+    Normalize OCR / label text for robust matching.
 
     Policy:
     - convert to string
@@ -230,13 +253,7 @@ def ocr_result_to_dict(res_obj: Any) -> Dict[str, Any]:
 
 def select_largest_prediction(ocr_dict: Dict[str, Any]) -> SelectedPrediction:
     """
-    Select the OCR detection corresponding to the largest box.
-
-    Preference order:
-    1) Use rec_boxes (axis-aligned boxes) if present.
-    2) Else compute area from rec_polys / dt_polys polygons.
-
-    Returns idx=None when no boxes exist.
+    Select the OCR detection corresponding to the largest box/polygon area.
     """
     rec_texts = as_list(ocr_dict.get("rec_texts"))
     rec_scores = as_list(ocr_dict.get("rec_scores"))
@@ -305,21 +322,8 @@ def select_largest_prediction(ocr_dict: Dict[str, Any]) -> SelectedPrediction:
     )
 
 
-def draw_ocr_visualization(
-    image_path: Path,
-    ocr_dict: Dict[str, Any],
-    selected: SelectedPrediction,
-    out_path: Path,
-) -> None:
-    """
-    Save a visualization image with OCR polygons/boxes drawn.
-
-    - All boxes drawn in blue
-    - Selected box drawn in red (thicker)
-    - Labels include recognized text + score (if available)
-
-    Note: This function never returns objects that are later serialized; it only writes the image.
-    """
+def draw_ocr_visualization(image_path: Path, ocr_dict: Dict[str, Any], selected: SelectedPrediction, out_path: Path) -> None:
+    """Save visualization image with polygons, highlighting the selected prediction."""
     img = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(img)
 
@@ -330,7 +334,6 @@ def draw_ocr_visualization(
     if not polys:
         polys = as_list(ocr_dict.get("dt_polys"))
 
-    # Keep font local; never store in JSON payload.
     try:
         font = ImageFont.load_default()
     except Exception:
@@ -338,20 +341,18 @@ def draw_ocr_visualization(
 
     for i, poly in enumerate(polys):
         try:
-            poly_pts = [(int(p[0]), int(p[1])) for p in poly]
+            pts = [(int(p[0]), int(p[1])) for p in poly]
         except Exception:
             continue
 
         is_sel = (selected.idx is not None and i == selected.idx)
         color = (255, 0, 0) if is_sel else (0, 128, 255)
         width = 3 if is_sel else 2
+        draw.line(pts + [pts[0]], fill=color, width=width)
 
-        draw.line(poly_pts + [poly_pts[0]], fill=color, width=width)
-
-        x1, y1, _, _ = poly_to_bbox([[p[0], p[1]] for p in poly_pts])
+        x1, y1, _, _ = poly_to_bbox([[p[0], p[1]] for p in pts])
         t = rec_texts[i] if i < len(rec_texts) else ""
         sc = rec_scores[i] if i < len(rec_scores) else None
-
         label = f"{t}"
         if sc is not None:
             try:
@@ -366,21 +367,17 @@ def draw_ocr_visualization(
                 tw = bbox[2] - bbox[0]
                 th = bbox[3] - bbox[1]
             except Exception:
-                # fallback rough sizing
                 tw, th = (len(label) * 6, 11)
 
-            draw.rectangle(
-                [x1, max(0, y1 - th - 2 * pad), x1 + tw + 2 * pad, y1],
-                fill=(255, 255, 255),
-            )
+            draw.rectangle([x1, max(0, y1 - th - 2 * pad), x1 + tw + 2 * pad, y1], fill=(255, 255, 255))
             draw.text((x1 + pad, max(0, y1 - th - pad)), label, fill=(0, 0, 0), font=font)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, quality=95)
 
 
-def build_file_mapping(meta_df: pd.DataFrame) -> Dict[str, str]:
-    """Map crop filename -> full crop_path using meta.csv's crop_path column."""
+def build_file_mapping_from_meta(meta_df: pd.DataFrame) -> Dict[str, str]:
+    """Map crop basename -> full crop_path using meta.csv crop_path."""
     mapping: Dict[str, str] = {}
     if "crop_path" not in meta_df.columns:
         return mapping
@@ -394,38 +391,91 @@ def find_default_output_root() -> Path:
     return Path.cwd() / "runs" / "ocr"
 
 
-# ----------------------------- Main evaluation ----------------------------- #
+def resolve_crop_path(row: Dict[str, Any], crops_dir: Optional[Path], meta_map: Optional[Dict[str, str]]) -> Tuple[Optional[Path], str]:
+    """Resolve crop path. See module docstring for priority order."""
+    file_name = str(row.get("file_name", ""))
+
+    if "crop_path" in row and str(row["crop_path"]).strip():
+        p = Path(str(row["crop_path"]))
+        if p.exists():
+            return p, "labels.crop_path"
+        return None, f"labels.crop_path missing on disk: {p}"
+
+    if crops_dir is not None:
+        p = crops_dir / file_name
+        if p.exists():
+            return p, "crops_dir/file_name"
+        return None, f"crops_dir join missing on disk: {p}"
+
+    if meta_map is not None:
+        p_str = meta_map.get(file_name, "")
+        if p_str:
+            p = Path(p_str)
+            if p.exists():
+                return p, "meta.csv mapping"
+            return None, f"meta.csv mapped path missing on disk: {p}"
+        return None, f"meta.csv has no entry for file_name={file_name}"
+
+    return None, "No path source available (need labels.crop_path or --crops_dir or --meta_csv)"
+
+
+# ----------------------------- CLI ----------------------------- #
+
+def add_bool_flag(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str) -> None:
+    """
+    Add a pair of boolean flags:
+      --<name> / --no-<name>
+    """
+    dest = name.replace("-", "_")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{name}", dest=dest, action="store_true", help=f"Enable {help_text}")
+    group.add_argument(f"--no-{name}", dest=dest, action="store_false", help=f"Disable {help_text}")
+    parser.set_defaults(**{dest: default})
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate PaddleOCR on crop dataset; select prediction from largest OCR box."
     )
     parser.add_argument("--labels_csv", type=str, required=True, help="Path to labels.csv (ground truth).")
-    parser.add_argument("--meta_csv", type=str, required=True, help="Path to meta.csv (contains crop_path).")
-    parser.add_argument(
-        "--output_root",
-        type=str,
-        default=str(find_default_output_root()),
-        help="Output root directory (default: ./runs/ocr).",
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default=f"ppocr_eval_{now_run_id()}",
-        help="Run directory name under output_root.",
-    )
+    parser.add_argument("--meta_csv", type=str, default=None,
+                        help="Optional path to meta.csv (contains crop_path). Not needed if --crops_dir is provided.")
+    parser.add_argument("--crops_dir", type=str, default=None,
+                        help="Directory containing crop images referenced by labels.csv file_name.")
+    parser.add_argument("--output_root", type=str, default=str(find_default_output_root()),
+                        help="Output root directory (default: ./runs/ocr).")
+    parser.add_argument("--run_name", type=str, default=f"ppocr_eval_{now_run_id()}",
+                        help="Run directory name under output_root.")
     parser.add_argument("--device", type=str, default="gpu", choices=["cpu", "gpu"], help="PaddleOCR device.")
     parser.add_argument("--lang", type=str, default="en", help="OCR language (default: en).")
+
+    # New: confidence threshold
+    parser.add_argument(
+        "--conf_thresh",
+        type=float,
+        default=0.75,
+        help="Only predictions with selected-box score >= this threshold are treated as valid predictions.",
+    )
+
     parser.add_argument("--max_samples", type=int, default=0, help="Optional cap on number of samples (0 = all).")
     parser.add_argument("--fail_fast", action="store_true", help="Stop on first exception.")
+
+    add_bool_flag(parser, "use_doc_orientation_classify", default=False,
+                  help_text="document orientation classification model")
+    add_bool_flag(parser, "use_doc_unwarping", default=False,
+                  help_text="document unwarping / rectification model")
+    add_bool_flag(parser, "use_textline_orientation", default=False,
+                  help_text="textline orientation classification model")
+
     return parser.parse_args()
 
+
+# ----------------------------- Main ----------------------------- #
 
 def main() -> None:
     args = parse_args()
 
     labels_csv = Path(args.labels_csv)
-    meta_csv = Path(args.meta_csv)
     output_root = Path(args.output_root)
     run_dir = output_root / args.run_name
 
@@ -436,19 +486,24 @@ def main() -> None:
     pred_img_dir.mkdir(parents=True, exist_ok=True)
 
     labels_df = pd.read_csv(labels_csv)
-    meta_df = pd.read_csv(meta_csv)
-
     required_cols = {"file_name", "bib_id"}
     missing = required_cols - set(labels_df.columns)
     if missing:
         raise ValueError(f"labels.csv is missing required columns: {sorted(missing)}")
 
-    file_map = build_file_mapping(meta_df)
+    crops_dir = Path(args.crops_dir) if args.crops_dir else None
+    if crops_dir is not None and not crops_dir.exists():
+        raise FileNotFoundError(f"--crops_dir does not exist: {crops_dir}")
+
+    meta_map: Optional[Dict[str, str]] = None
+    if args.meta_csv:
+        meta_df = pd.read_csv(Path(args.meta_csv))
+        meta_map = build_file_mapping_from_meta(meta_df)
 
     ocr = PaddleOCR(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
+        use_doc_orientation_classify=bool(args.use_doc_orientation_classify),
+        use_doc_unwarping=bool(args.use_doc_unwarping),
+        use_textline_orientation=bool(args.use_textline_orientation),
         lang=args.lang,
         device=args.device,
     )
@@ -458,20 +513,19 @@ def main() -> None:
     n_eval = n_total if args.max_samples <= 0 else min(n_total, args.max_samples)
 
     t0 = time.time()
-    n_with_boxes = 0
-    n_no_boxes = 0
     n_errors = 0
 
     for idx_row in range(n_eval):
         row = labels_df.iloc[idx_row].to_dict()
         file_name = str(row["file_name"])
-        gt = str(row["bib_id"])
+        gt_raw = row.get("bib_id", "")
+        gt_norm = normalize_text(gt_raw)
 
-        crop_path_str = file_map.get(file_name, "")
-        crop_path = Path(crop_path_str) if crop_path_str else None
+        crop_path, path_source = resolve_crop_path(row, crops_dir=crops_dir, meta_map=meta_map)
 
         out_row: Dict[str, Any] = dict(row)
         out_row["crop_path"] = str(crop_path) if crop_path else ""
+        out_row["path_source"] = path_source
 
         stem = Path(file_name).stem
         json_out_path = pred_json_dir / f"{stem}.json"
@@ -488,26 +542,32 @@ def main() -> None:
         out_row["pred_bbox_x2"] = None
         out_row["pred_bbox_y2"] = None
         out_row["n_boxes"] = 0
+        out_row["pred_is_valid"] = False  # NEW: passes confidence threshold
+        out_row["gt_is_empty"] = (gt_norm == "")  # NEW
         out_row["error"] = ""
         out_row["viz_error"] = ""
 
-        # Define payload up-front so it always exists (fixes your NameError)
         payload: Dict[str, Any] = {
             "file_name": file_name,
             "crop_path": str(crop_path) if crop_path else "",
-            "ground_truth": {"bib_id": gt, "bib_id_norm": normalize_text(gt)},
+            "path_source": path_source,
+            "ground_truth": {"raw": str(gt_raw), "norm": gt_norm, "is_empty": (gt_norm == "")},
+            "config": {
+                "device": args.device,
+                "lang": args.lang,
+                "conf_thresh": args.conf_thresh,
+                "use_doc_orientation_classify": bool(args.use_doc_orientation_classify),
+                "use_doc_unwarping": bool(args.use_doc_unwarping),
+                "use_textline_orientation": bool(args.use_textline_orientation),
+            },
         }
 
         if crop_path is None or not crop_path.exists():
-            msg = f"Missing crop_path for {file_name} (looked up via meta.csv mapping)."
+            msg = f"Missing crop_path: {path_source}"
             out_row["error"] = msg
             payload["error"] = msg
             n_errors += 1
-
-            # Still write JSON for debugging
-            json_out_path.parent.mkdir(parents=True, exist_ok=True)
             json_out_path.write_text(json_dump_safe(payload, indent=2), encoding="utf-8")
-
             rows_out.append(out_row)
             if args.fail_fast:
                 raise FileNotFoundError(msg)
@@ -523,11 +583,7 @@ def main() -> None:
             rec_texts = as_list(ocr_dict.get("rec_texts"))
             out_row["n_boxes"] = int(len(rec_texts))
 
-            if selected.idx is None:
-                n_no_boxes += 1
-            else:
-                n_with_boxes += 1
-
+            # Raw selected values
             out_row["pred_text"] = selected.text
             out_row["pred_text_norm"] = normalize_text(selected.text)
             out_row["pred_score"] = selected.score
@@ -539,28 +595,30 @@ def main() -> None:
                 out_row["pred_bbox_x2"] = x2
                 out_row["pred_bbox_y2"] = y2
 
+            # NEW: apply confidence threshold to decide whether this is a "valid prediction"
+            score_ok = (selected.score is not None and float(selected.score) >= float(args.conf_thresh))
+            has_any_box = out_row["n_boxes"] > 0
+            pred_is_valid = bool(has_any_box and score_ok)
+            out_row["pred_is_valid"] = pred_is_valid
+
             payload["ocr_output"] = ocr_dict
             payload["selected"] = {
                 "idx": selected.idx,
                 "text": selected.text,
-                "text_norm": normalize_text(selected.text),
+                "text_norm": out_row["pred_text_norm"],
                 "score": selected.score,
                 "bbox_xyxy": selected.bbox_xyxy,
                 "poly": selected.poly,
+                "pred_is_valid": pred_is_valid,
+                "conf_thresh": args.conf_thresh,
             }
 
-            # --- Write JSON (robust) ---
-            json_out_path.parent.mkdir(parents=True, exist_ok=True)
+            # Save JSON
             json_out_path.write_text(json_dump_safe(payload, indent=2), encoding="utf-8")
 
-            # --- Write visualization (best effort, should not fail the whole sample) ---
+            # Save viz best-effort
             try:
-                draw_ocr_visualization(
-                    image_path=crop_path,
-                    ocr_dict=ocr_dict,
-                    selected=selected,
-                    out_path=img_out_path,
-                )
+                draw_ocr_visualization(crop_path, ocr_dict, selected, img_out_path)
             except Exception as viz_e:
                 out_row["viz_error"] = f"{type(viz_e).__name__}: {viz_e}"
 
@@ -568,56 +626,73 @@ def main() -> None:
             out_row["error"] = f"{type(e).__name__}: {e}"
             payload["error"] = out_row["error"]
             n_errors += 1
-
-            # Try to still write a JSON so you can inspect failures
             try:
-                json_out_path.parent.mkdir(parents=True, exist_ok=True)
                 json_out_path.write_text(json_dump_safe(payload, indent=2), encoding="utf-8")
             except Exception:
                 pass
-
             if args.fail_fast:
                 raise
         finally:
             rows_out.append(out_row)
 
     elapsed = time.time() - t0
-
     pred_df = pd.DataFrame(rows_out)
 
-    gt_norm = pred_df["bib_id"].astype(str).map(normalize_text)
-    pred_norm = pred_df["pred_text_norm"].astype(str).fillna("")
-    has_pred = pred_df["n_boxes"].fillna(0).astype(int) > 0
+    # ----------------------------- Metrics ----------------------------- #
+    gt_norm_series = pred_df["bib_id"].map(normalize_text)
+    gt_is_empty = (gt_norm_series == "")
 
-    exact_norm = (pred_norm == gt_norm) & has_pred
-    acc_norm = float(exact_norm.sum()) / float(len(pred_df)) if len(pred_df) else 0.0
+    pred_norm_series = pred_df["pred_text_norm"].astype(str).fillna("")
+    pred_score = pred_df["pred_score"]
+    n_boxes = pred_df["n_boxes"].fillna(0).astype(int)
 
+    # "valid prediction" = has boxes AND score >= conf_thresh
+    score_ok = pred_score.apply(lambda x: (x is not None) and (float(x) >= float(args.conf_thresh)))
+    pred_is_valid = (n_boxes > 0) & score_ok
+
+    # Precision-style metric among valid predictions only
+    valid_matches = pred_is_valid & (pred_norm_series == gt_norm_series)
+    precision_valid = float(valid_matches.sum()) / float(pred_is_valid.sum()) if int(pred_is_valid.sum()) > 0 else 0.0
+
+    # Accuracy allowing empty GT:
+    # - GT non-empty: must have valid prediction and match
+    # - GT empty: must have NO valid prediction
+    correct_nonempty = (~gt_is_empty) & pred_is_valid & (pred_norm_series == gt_norm_series)
+    correct_empty = gt_is_empty & (~pred_is_valid)
+    accuracy_allow_empty = float((correct_nonempty | correct_empty).sum()) / float(len(pred_df)) if len(pred_df) else 0.0
+
+    coverage_valid = float(pred_is_valid.sum()) / float(len(pred_df)) if len(pred_df) else 0.0
+
+    # Keep your distance metrics too (computed on normalized strings; for empty GT it's fine)
     dists: List[int] = []
-    for p, g, ok in zip(pred_norm.tolist(), gt_norm.tolist(), has_pred.tolist()):
-        dists.append(len(g) if not ok else levenshtein(p, g))
+    for p, g in zip(pred_norm_series.tolist(), gt_norm_series.tolist()):
+        dists.append(levenshtein(p, g))
     pred_df["edit_distance_norm"] = dists
-    pred_df["is_exact_norm"] = exact_norm.astype(bool)
 
-    mean_dist = float(sum(dists) / len(dists)) if dists else 0.0
-    mean_cer = float(
-        sum(d / max(1, len(g)) for d, g in zip(dists, gt_norm.tolist())) / len(dists)
-    ) if dists else 0.0
+    # Report booleans used above
+    pred_df["gt_is_empty"] = gt_is_empty.astype(bool)
+    pred_df["pred_is_valid"] = pred_is_valid.astype(bool)
+    pred_df["is_match_norm"] = (pred_norm_series == gt_norm_series).astype(bool)
 
     summary = {
         "run_name": args.run_name,
         "labels_csv": str(labels_csv),
-        "meta_csv": str(meta_csv),
+        "meta_csv": str(args.meta_csv) if args.meta_csv else None,
+        "crops_dir": str(crops_dir) if crops_dir else None,
         "output_dir": str(run_dir),
-        "device": args.device,
-        "lang": args.lang,
+        "config": {
+            "device": args.device,
+            "lang": args.lang,
+            "conf_thresh": float(args.conf_thresh),
+            "use_doc_orientation_classify": bool(args.use_doc_orientation_classify),
+            "use_doc_unwarping": bool(args.use_doc_unwarping),
+            "use_textline_orientation": bool(args.use_textline_orientation),
+        },
         "n_samples": int(len(pred_df)),
-        "n_with_boxes": int(n_with_boxes),
-        "n_no_boxes": int(n_no_boxes),
         "n_errors": int(n_errors),
-        "coverage": float(n_with_boxes / len(pred_df)) if len(pred_df) else 0.0,
-        "accuracy_exact_norm": acc_norm,
-        "mean_edit_distance_norm": mean_dist,
-        "mean_cer_norm": mean_cer,
+        "coverage_valid": coverage_valid,
+        "accuracy_allow_empty": accuracy_allow_empty,
+        "precision_valid": precision_valid,
         "elapsed_sec": elapsed,
         "sec_per_sample": float(elapsed / len(pred_df)) if len(pred_df) else None,
     }
@@ -628,22 +703,24 @@ def main() -> None:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print("\n=== OCR Evaluation Summary ===")
-    print(f"Run dir:              {run_dir}")
-    print(f"Samples:              {summary['n_samples']}")
-    print(f"Coverage (has boxes): {summary['coverage']:.3f} ({summary['n_with_boxes']}/{summary['n_samples']})")
-    print(f"Errors:               {summary['n_errors']}")
-    print(f"Accuracy (norm exact):{summary['accuracy_exact_norm']:.3f}")
-    print(f"Mean edit dist (norm):{summary['mean_edit_distance_norm']:.3f}")
-    print(f"Mean CER (norm):      {summary['mean_cer_norm']:.3f}")
-    print(f"Time:                 {summary['elapsed_sec']:.2f}s ({summary['sec_per_sample']:.3f}s/sample)")
+    print(f"Run dir:                 {run_dir}")
+    print(f"Samples:                 {summary['n_samples']}")
+    print(f"Errors:                  {summary['n_errors']}")
+    print(f"Conf thresh:             {summary['config']['conf_thresh']:.2f}")
+    print(f"Coverage (valid preds):  {summary['coverage_valid']:.3f} ({int(pred_is_valid.sum())}/{summary['n_samples']})")
+    print(f"Accuracy (allow empty):  {summary['accuracy_allow_empty']:.3f}")
+    print(f"Precision (valid preds): {summary['precision_valid']:.3f}")
+    print(f"Time:                    {summary['elapsed_sec']:.2f}s ({summary['sec_per_sample']:.3f}s/sample)")
 
-    mismatches = pred_df[~pred_df["is_exact_norm"]].copy()
-    mismatches = mismatches[mismatches["error"].astype(str).str.len() == 0]
-    if len(mismatches) > 0:
-        mismatches = mismatches.sort_values("edit_distance_norm", ascending=False).head(10)
-        print("\nTop mismatches (by edit distance):")
-        for _, r in mismatches.iterrows():
-            print(f"- {r['file_name']}: gt={r['bib_id']} pred={r['pred_text']} dist={r['edit_distance_norm']}")
+    # Optional: show top mismatches among valid predictions
+    mism = pred_df[pred_is_valid & (pred_df["is_match_norm"] == False) & (pred_df["error"].astype(str).str.len() == 0)].copy()
+    if len(mism) > 0:
+        mism = mism.assign(gt_norm=gt_norm_series, pred_norm=pred_norm_series)
+        mism["dist"] = mism.apply(lambda r: levenshtein(str(r["pred_norm"]), str(r["gt_norm"])), axis=1)
+        mism = mism.sort_values("dist", ascending=False).head(10)
+        print("\nTop mismatches among valid predictions:")
+        for _, r in mism.iterrows():
+            print(f"- {r['file_name']}: gt={r['bib_id']} pred={r['pred_text']} score={r['pred_score']} dist={r['dist']}")
 
 
 if __name__ == "__main__":
